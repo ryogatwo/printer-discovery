@@ -4,12 +4,12 @@ import os
 import socket
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI
-from zeroconf import IPVersion, ServiceBrowser, ServiceListener, Zeroconf
+from zeroconf import IPVersion
+from zeroconf.asyncio import AsyncZeroconf  # <-- key change
 
-# PySNMP v7+ (asyncio, v3arch)
 from pysnmp.hlapi.v3arch.asyncio import (
     SnmpEngine,
     CommunityData,
@@ -21,14 +21,14 @@ from pysnmp.hlapi.v3arch.asyncio import (
     bulk_walk_cmd,
 )
 
-app = FastAPI(title="Printer Discovery", version="1.1.0")
+app = FastAPI(title="Printer Discovery", version="1.2.0")
 
 # -------------------------
 # Config (env)
 # -------------------------
 SUBNET = os.getenv("SUBNET", "10.1.10.0/24")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # seconds
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "0.25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "200"))
 
@@ -40,22 +40,16 @@ SNMP_PORT = int(os.getenv("SNMP_PORT", "161"))
 SNMP_TIMEOUT = float(os.getenv("SNMP_TIMEOUT", "1.0"))
 SNMP_RETRIES = int(os.getenv("SNMP_RETRIES", "0"))
 
-# QUALIFY = ports that determine "this is a printer"
+# Only these ports qualify a device as a printer
 QUALIFY_PORTS = [int(p) for p in os.getenv("QUALIFY_PORTS", "9100,631,515").split(",") if p.strip()]
-
-# WEB = ports used only to build clickable links (do NOT qualify)
+# Only used to build a clickable link (do NOT qualify)
 WEB_PORTS = [int(p) for p in os.getenv("WEB_PORTS", "443,80").split(",") if p.strip()]
 
-# OIDs (best-effort; printers vary)
+# OIDs (best-effort)
 OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0"
 OID_SYS_NAME = "1.3.6.1.2.1.1.5.0"
-
-# Printer-MIB prtGeneralSerialNumber.1
 OID_PRT_SERIAL = "1.3.6.1.2.1.43.5.1.1.17.1"
-# ENTITY-MIB entPhysicalSerialNum.1 (some vendors)
 OID_ENT_SERIAL_1 = "1.3.6.1.2.1.47.1.1.1.1.11.1"
-
-# IF-MIB ifPhysAddress.<ifIndex>
 OID_IF_PHYS_ADDR_BASE = "1.3.6.1.2.1.2.2.1.6"
 
 # -------------------------
@@ -75,22 +69,19 @@ class Printer:
 
     @property
     def details(self) -> str:
-        parts = [
-            f"IP: {self.ip}",
-            f"MAC: {self.mac or '—'}",
-            f"Serial: {self.serial or '—'}",
-        ]
-        return " | ".join(parts)
+        return " | ".join(
+            [
+                f"IP: {self.ip}",
+                f"MAC: {self.mac or '—'}",
+                f"Serial: {self.serial or '—'}",
+            ]
+        )
 
 
-# In-memory store
 PRINTERS: Dict[str, Printer] = {}
 LAST_SCAN: float = 0.0
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def _now() -> float:
     return time.time()
 
@@ -105,8 +96,7 @@ def _format_mac(raw: bytes) -> Optional[str]:
 
 async def _tcp_probe(ip: str, port: int, timeout: float) -> bool:
     try:
-        fut = asyncio.open_connection(ip, port)
-        reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
         writer.close()
         try:
             await writer.wait_closed()
@@ -122,15 +112,10 @@ async def _open_print_ports(ip: str) -> List[int]:
         *[_tcp_probe(ip, p, CONNECT_TIMEOUT) for p in QUALIFY_PORTS],
         return_exceptions=True,
     )
-    open_ports: List[int] = []
-    for p, ok in zip(QUALIFY_PORTS, checks):
-        if ok is True:
-            open_ports.append(p)
-    return open_ports
+    return [p for p, ok in zip(QUALIFY_PORTS, checks) if ok is True]
 
 
 async def _pick_web_url(ip: str) -> str:
-    # Prefer https if open, else http if open, else plain http (still clickable)
     for p in WEB_PORTS:
         if await _tcp_probe(ip, p, CONNECT_TIMEOUT):
             if p == 443:
@@ -164,9 +149,7 @@ async def snmp_get(ip: str, oids: List[str]) -> Dict[str, str]:
             return {}
         out: Dict[str, str] = {}
         for vb in outVarBinds:
-            oid_str = vb[0].prettyPrint()
-            val_str = vb[1].prettyPrint()
-            out[oid_str] = val_str
+            out[vb[0].prettyPrint()] = vb[1].prettyPrint()
         return out
     finally:
         try:
@@ -196,8 +179,8 @@ async def snmp_walk_first_mac(ip: str) -> Optional[str]:
             auth,
             target,
             ctx,
-            0,   # nonRepeaters
-            25,  # maxRepetitions
+            0,
+            25,
             base,
             lexicographicMode=False,
             lookupMib=False,
@@ -234,26 +217,29 @@ def _merge_printer(p: Printer) -> None:
     existing.serial = existing.serial or p.serial
     existing.mac = existing.mac or p.mac
     existing.sys_descr = existing.sys_descr or p.sys_descr
-    # merge print_ports if missing
     if not existing.print_ports and p.print_ports:
         existing.print_ports = p.print_ports
 
 
 # -------------------------
-# mDNS discovery (optional)
+# mDNS discovery (AsyncZeroconf)
 # -------------------------
-class PrinterListener(ServiceListener):
-    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        asyncio.create_task(self._handle(zc, type_, name))
+class MdnsListener:
+    def __init__(self, aiozc: AsyncZeroconf):
+        self.aiozc = aiozc
 
-    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        asyncio.create_task(self._handle(zc, type_, name))
+    def add_service(self, zc, type_: str, name: str) -> None:
+        asyncio.create_task(self._handle(type_, name))
 
-    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+    def update_service(self, zc, type_: str, name: str) -> None:
+        asyncio.create_task(self._handle(type_, name))
+
+    def remove_service(self, zc, type_: str, name: str) -> None:
         pass
 
-    async def _handle(self, zc: Zeroconf, type_: str, name: str) -> None:
-        info = zc.get_service_info(type_, name)
+    async def _handle(self, type_: str, name: str) -> None:
+        # Use AsyncZeroconf helper (timeout is ms)
+        info = await self.aiozc.async_get_service_info(type_, name, timeout=1500)
         if not info or not info.addresses:
             return
 
@@ -267,16 +253,10 @@ class PrinterListener(ServiceListener):
 
         display = name.split(".")[0] if name else ip
 
-        # For mDNS-advertised printers, the service port itself is often 631/443/etc.
         mdns_port = int(info.port) if info.port else None
         print_ports = [mdns_port] if (mdns_port in QUALIFY_PORTS) else None
 
-        web = None
-        if mdns_port in (80, 443):
-            scheme = "https" if mdns_port == 443 else "http"
-            web = f"{scheme}://{ip}/"
-        else:
-            web = await _pick_web_url(ip)
+        web = await _pick_web_url(ip)
 
         p = Printer(
             name=display,
@@ -292,23 +272,19 @@ class PrinterListener(ServiceListener):
 async def mdns_task():
     if not ENABLE_MDNS:
         return
-    zc = Zeroconf(ip_version=IPVersion.V4Only)
-    listener = PrinterListener()
 
-    types = [
-        "_printer._tcp.local.",
-        "_ipp._tcp.local.",
-        "_ipps._tcp.local.",
-    ]
-    browsers = [ServiceBrowser(zc, t, listener) for t in types]
+    aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only)
+    listener = MdnsListener(aiozc)
+
     try:
+        # These are the common printer-ish service types
+        for t in ["_printer._tcp.local.", "_ipp._tcp.local.", "_ipps._tcp.local."]:
+            await aiozc.async_add_service_listener(t, listener)
+
         while True:
             await asyncio.sleep(3600)
     finally:
-        try:
-            zc.close()
-        except Exception:
-            pass
+        await aiozc.async_close()
 
 
 # -------------------------
@@ -329,7 +305,7 @@ async def scan_subnet_once():
             web = await _pick_web_url(ip)
 
             p = Printer(
-                name=ip,  # will be replaced by sysName if available
+                name=ip,
                 ip=ip,
                 web=web,
                 source="scan",
@@ -337,29 +313,28 @@ async def scan_subnet_once():
                 print_ports=print_ports,
             )
 
-            if ENABLE_SNMP:
-                got = await snmp_get(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
+            got = await snmp_get(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
 
-                def pick_val(endswith: str) -> Optional[str]:
-                    for k, v in got.items():
-                        if k.endswith(endswith):
-                            return v
-                    return None
+            def pick_val(endswith: str) -> Optional[str]:
+                for k, v in got.items():
+                    if k.endswith(endswith):
+                        return v
+                return None
 
-                sys_name = pick_val(OID_SYS_NAME)
-                sys_descr = pick_val(OID_SYS_DESCR)
-                serial = pick_val(OID_PRT_SERIAL) or pick_val(OID_ENT_SERIAL_1)
+            sys_name = pick_val(OID_SYS_NAME)
+            sys_descr = pick_val(OID_SYS_DESCR)
+            serial = pick_val(OID_PRT_SERIAL) or pick_val(OID_ENT_SERIAL_1)
 
-                if sys_name:
-                    p.name = sys_name
-                if sys_descr:
-                    p.sys_descr = sys_descr
-                if serial and serial.strip():
-                    p.serial = serial.strip()
+            if sys_name:
+                p.name = sys_name
+            if sys_descr:
+                p.sys_descr = sys_descr
+            if serial and serial.strip():
+                p.serial = serial.strip()
 
-                mac = await snmp_walk_first_mac(ip)
-                if mac:
-                    p.mac = mac
+            mac = await snmp_walk_first_mac(ip)
+            if mac:
+                p.mac = mac
 
             _merge_printer(p)
 
@@ -388,6 +363,8 @@ def health():
         "last_scan": LAST_SCAN,
         "qualify_ports": QUALIFY_PORTS,
         "web_ports": WEB_PORTS,
+        "enable_mdns": ENABLE_MDNS,
+        "enable_snmp": ENABLE_SNMP,
     }
 
 
