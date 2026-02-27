@@ -20,6 +20,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     ObjectIdentity,
     get_cmd,
     bulk_walk_cmd,
+    walk_cmd,  # <-- NEW: GETNEXT-style walk fallback
 )
 
 # -------------------------
@@ -28,7 +29,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger("printer-discovery")
 
-app = FastAPI(title="Printer Discovery", version="1.2.2")
+app = FastAPI(title="Printer Discovery", version="1.2.3")
 
 # -------------------------
 # Config (env)
@@ -104,9 +105,14 @@ def _now() -> float:
 def _format_mac(raw: bytes) -> Optional[str]:
     if not raw:
         return None
+    # Some agents return variable-length addresses; prefer last 6 bytes if longer.
+    if len(raw) > 6:
+        raw = raw[-6:]
+    if len(raw) != 6:
+        return None
     if all(b == 0x00 for b in raw):
         return None
-    # ignore multicast MACs (least significant bit of first octet set)
+    # ignore multicast MACs (LSB of first octet set)
     if raw[0] & 0x01:
         return None
     return ":".join(f"{b:02X}" for b in raw)
@@ -116,18 +122,40 @@ def _mac_to_compact(mac: str) -> str:
     return re.sub(r"[^0-9a-fA-F]", "", mac).lower()
 
 
-def _extract_mdns_mac_hint(name: str) -> Optional[str]:
-    # Examples: "Brother HL-L2460DW [94ddf86a9634]" -> "94ddf86a9634"
-    m = re.search(r"\[([0-9a-fA-F]{8,16})\]", name or "")
-    return m.group(1).lower() if m else None
+def _extract_mac_hint(text: str) -> Optional[str]:
+    """
+    Tries to pull a MAC-ish hint from common printer naming patterns:
+      - "... [94ddf86a9634]"
+      - "BRWD8B32F1E6A9C"  (Brother-style)
+      - any 12-hex run
+    Returns 12 hex lowercase if found.
+    """
+    s = (text or "").strip()
+
+    # bracket form: [94ddf86a9634]
+    m = re.search(r"\[([0-9a-fA-F]{12})\]", s)
+    if m:
+        return m.group(1).lower()
+
+    # Brother-ish: BRW + 12 hex
+    m = re.search(r"\bBRW([0-9a-fA-F]{12})\b", s)
+    if m:
+        return m.group(1).lower()
+
+    # any 12-hex chunk (last resort)
+    m = re.search(r"([0-9a-fA-F]{12})", s)
+    if m:
+        return m.group(1).lower()
+
+    return None
 
 
-def _choose_best_mac(candidates: List[str], hint: Optional[str]) -> Optional[str]:
+def _choose_best_mac(candidates: List[str], hint12: Optional[str]) -> Optional[str]:
     if not candidates:
         return None
-    if hint:
+    if hint12:
         for mac in candidates:
-            if _mac_to_compact(mac).endswith(hint) or hint in _mac_to_compact(mac):
+            if _mac_to_compact(mac).endswith(hint12):
                 return mac
     return candidates[0]
 
@@ -210,7 +238,6 @@ async def snmp_get_map(ip: str, oids: List[str]) -> Dict[str, str]:
             return {}
 
         out: Dict[str, str] = {}
-        # Map values back to the requested OIDs in order
         for req_oid, vb in zip(oids, outVarBinds):
             out[req_oid] = vb[1].prettyPrint()
         return out
@@ -221,13 +248,11 @@ async def snmp_get_map(ip: str, oids: List[str]) -> Dict[str, str]:
             pass
 
 
-async def snmp_walk_macs(ip: str) -> List[str]:
+async def _snmp_walk_ifphysaddress_getbulk(ip: str) -> List[str]:
     """
-    Walk IF-MIB ifPhysAddress and return list of non-empty MACs.
+    Fast path: GETBULK walk ifPhysAddress.
+    Some printers don't behave well here; caller will fallback to GETNEXT walk.
     """
-    if not ENABLE_SNMP:
-        return []
-
     snmpEngine = SnmpEngine()
     auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
     target = await UdpTransportTarget.create(
@@ -271,7 +296,68 @@ async def snmp_walk_macs(ip: str) -> List[str]:
             pass
 
 
-async def snmp_enrich(ip: str, name_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+async def _snmp_walk_ifphysaddress_getnext(ip: str) -> List[str]:
+    """
+    Reliable path: GETNEXT-style walk (like snmpwalk).
+    """
+    snmpEngine = SnmpEngine()
+    auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
+    target = await UdpTransportTarget.create(
+        (ip, SNMP_PORT),
+        timeout=SNMP_TIMEOUT,
+        retries=SNMP_RETRIES,
+    )
+    ctx = ContextData()
+    base = ObjectType(ObjectIdentity(OID_IF_PHYS_ADDR_BASE))
+
+    macs: List[str] = []
+    try:
+        async for (errorIndication, errorStatus, errorIndex, varBinds) in walk_cmd(
+            snmpEngine,
+            auth,
+            target,
+            ctx,
+            base,
+            lexicographicMode=False,
+            lookupMib=False,
+        ):
+            if errorIndication or errorStatus:
+                return []
+
+            for vb in varBinds:
+                val = vb[1]
+                try:
+                    raw = val.asOctets() if hasattr(val, "asOctets") else bytes(val)
+                except Exception:
+                    raw = b""
+                mac = _format_mac(raw)
+                if mac and mac not in macs:
+                    macs.append(mac)
+        return macs
+    finally:
+        try:
+            snmpEngine.close_dispatcher()
+        except Exception:
+            pass
+
+
+async def snmp_walk_macs(ip: str) -> List[str]:
+    """
+    Returns list of MACs from IF-MIB ifPhysAddress, best-effort.
+    Tries GETBULK first, then GETNEXT walk fallback.
+    """
+    if not ENABLE_SNMP:
+        return []
+
+    macs = await _snmp_walk_ifphysaddress_getbulk(ip)
+    if macs:
+        return macs
+
+    # Fallback for printers that don't like GETBULK
+    return await _snmp_walk_ifphysaddress_getnext(ip)
+
+
+async def snmp_enrich(ip: str, name_for_hint: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Returns (sys_name, sys_descr, serial, mac)
     """
@@ -281,13 +367,20 @@ async def snmp_enrich(ip: str, name_hint: Optional[str] = None) -> Tuple[Optiona
     try:
         got = await snmp_get_map(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
 
-        sys_name = got.get(OID_SYS_NAME)
-        sys_descr = got.get(OID_SYS_DESCR)
-
+        sys_name = (got.get(OID_SYS_NAME) or "").strip() or None
+        sys_descr = (got.get(OID_SYS_DESCR) or "").strip() or None
         serial = (got.get(OID_PRT_SERIAL) or got.get(OID_ENT_SERIAL_1) or "").strip() or None
 
         mac_candidates = await snmp_walk_macs(ip)
-        mac = _choose_best_mac(mac_candidates, name_hint)
+
+        hint12 = None
+        # Prefer sys_name if present; else use mDNS display name
+        if sys_name:
+            hint12 = _extract_mac_hint(sys_name)
+        if not hint12 and name_for_hint:
+            hint12 = _extract_mac_hint(name_for_hint)
+
+        mac = _choose_best_mac(mac_candidates, hint12)
 
         return sys_name, sys_descr, serial, mac
     except Exception as e:
@@ -312,7 +405,7 @@ class MdnsListener(ServiceListener):
         pass
 
     def _schedule(self, zc: Zeroconf, type_: str, name: str) -> None:
-        # Called from zeroconf worker thread -> schedule onto main asyncio loop
+        # zeroconf runs callbacks in its own thread; schedule on main asyncio loop
         fut = asyncio.run_coroutine_threadsafe(self._handle(zc, type_, name), self.loop)
         fut.add_done_callback(lambda f: f.exception() if (not f.cancelled()) else None)
 
@@ -335,12 +428,10 @@ class MdnsListener(ServiceListener):
         display = name.split(".")[0] if name else ip
         mdns_port = int(info.port) if info.port else None
 
-        # For display only; qualification is handled by subnet scan
         print_ports = [mdns_port] if (mdns_port in QUALIFY_PORTS) else None
         web = await _pick_web_url(ip)
 
-        hint = _extract_mdns_mac_hint(display)
-        sys_name, sys_descr, serial, mac = await snmp_enrich(ip, hint)
+        sys_name, sys_descr, serial, mac = await snmp_enrich(ip, display)
 
         p = Printer(
             name=(sys_name or display),
