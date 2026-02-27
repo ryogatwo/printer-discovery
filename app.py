@@ -3,89 +3,104 @@ import ipaddress
 import os
 import socket
 import time
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
 from zeroconf import IPVersion, ServiceBrowser, ServiceListener, Zeroconf
 
-from pysnmp.hlapi.asyncio import (
-    CommunityData,
-    ContextData,
-    ObjectIdentity,
-    ObjectType,
+# PySNMP v7+ (asyncio, v3arch)
+from pysnmp.hlapi.v3arch.asyncio import (
     SnmpEngine,
+    CommunityData,
     UdpTransportTarget,
-    getCmd,
-    nextCmd,
+    ContextData,
+    ObjectType,
+    ObjectIdentity,
+    get_cmd,
+    bulk_walk_cmd,
 )
 
-app = FastAPI()
+APP = FastAPI(title="Printer Discovery", version="1.0.0")
 
-# ----------------------------
+# -------------------------
 # Config (env)
-# ----------------------------
-SUBNETS = [s.strip() for s in os.getenv("SUBNETS", "10.1.10.0/24").split(",") if s.strip()]
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))  # seconds
+# -------------------------
+SUBNET = os.getenv("SUBNET", "10.1.10.0/24")
+API_PORT = int(os.getenv("PORT", "8787"))
 
-PROBE_PORTS = [int(p) for p in os.getenv("PROBE_PORTS", "9100,631,80,443").split(",") if p.strip()]
-TCP_TIMEOUT = float(os.getenv("TCP_TIMEOUT", "0.35"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # seconds
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "0.25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "200"))
 
-# Heuristic: if true, only count devices with 9100 or 631 as printers (reduces false positives)
-REQUIRE_PRINT_PORT = os.getenv("REQUIRE_PRINT_PORT", "false").strip().lower() in ("1", "true", "yes", "y")
+ENABLE_MDNS = os.getenv("ENABLE_MDNS", "true").lower() == "true"
+ENABLE_SNMP = os.getenv("ENABLE_SNMP", "true").lower() == "true"
 
-# Optional: reverse DNS is slow/noisy on some networks; default OFF
-ENABLE_REVERSE_DNS = os.getenv("ENABLE_REVERSE_DNS", "false").strip().lower() in ("1", "true", "yes", "y")
-
-# Optional: skip IPs
-EXCLUDE_IPS = {x.strip() for x in os.getenv("EXCLUDE_IPS", "").split(",") if x.strip()}
-
-# SNMP
-ENABLE_SNMP = os.getenv("ENABLE_SNMP", "true").strip().lower() in ("1", "true", "yes", "y")
 SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "public")
-SNMP_TIMEOUT = float(os.getenv("SNMP_TIMEOUT", "0.6"))
+SNMP_PORT = int(os.getenv("SNMP_PORT", "161"))
+SNMP_TIMEOUT = float(os.getenv("SNMP_TIMEOUT", "1.0"))
 SNMP_RETRIES = int(os.getenv("SNMP_RETRIES", "0"))
-SNMP_CONCURRENCY = int(os.getenv("SNMP_CONCURRENCY", "60"))
 
-# Printer-MIB serial number: prtGeneralSerialNumber.1
-OID_SERIAL = "1.3.6.1.2.1.43.5.1.1.17.1"
-# IF-MIB MAC addresses: ifPhysAddress.*
-OID_IFPHYS = "1.3.6.1.2.1.2.2.1.6"
+# Ports that strongly suggest “printer-ish”
+PRINTER_PORTS = [9100, 631, 515, 80, 443]
 
-# mDNS service types to listen for
-MDNS_TYPES = [
-    "_ipp._tcp.local.",
-    "_printer._tcp.local.",
-]
+# OIDs (best-effort; printers vary)
+OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0"
+OID_SYS_NAME = "1.3.6.1.2.1.1.5.0"
 
-# ----------------------------
-# Cache
-# ----------------------------
-_cache: Dict[str, object] = {"ts": 0.0, "data": []}
+# Printer-MIB prtGeneralSerialNumber.1
+OID_PRT_SERIAL = "1.3.6.1.2.1.43.5.1.1.17.1"
+# ENTITY-MIB entPhysicalSerialNum.1 (some vendors)
+OID_ENT_SERIAL_1 = "1.3.6.1.2.1.47.1.1.1.1.11.1"
 
+# IF-MIB ifPhysAddress.<ifIndex>
+OID_IF_PHYS_ADDR_BASE = "1.3.6.1.2.1.2.2.1.6"
 
-# ----------------------------
+# -------------------------
+# Data model
+# -------------------------
+@dataclass
+class Printer:
+    name: str
+    ip: str
+    web: Optional[str] = None
+    serial: Optional[str] = None
+    mac: Optional[str] = None
+    sys_descr: Optional[str] = None
+    source: str = "scan"  # scan|mdns|both
+    last_seen: float = 0.0
+
+    @property
+    def details(self) -> str:
+        parts = [
+            f"IP: {self.ip}",
+            f"MAC: {self.mac or '—'}",
+            f"Serial: {self.serial or '—'}",
+        ]
+        return " | ".join(parts)
+
+# In-memory store
+PRINTERS: Dict[str, Printer] = {}
+LAST_SCAN: float = 0.0
+
+# -------------------------
 # Helpers
-# ----------------------------
-def _expand_subnets() -> List[str]:
-    ips: List[str] = []
-    for s in SUBNETS:
-        net = ipaddress.ip_network(s, strict=False)
-        for host in net.hosts():
-            ip = str(host)
-            if ip in EXCLUDE_IPS:
-                continue
-            ips.append(ip)
-            # guardrail for giant nets
-            if len(ips) > 4096:
-                break
-    return ips
+# -------------------------
+def _now() -> float:
+    return time.time()
 
+def _format_mac(raw: bytes) -> Optional[str]:
+    if not raw:
+        return None
+    # Filter out obvious “empty” values
+    if all(b == 0x00 for b in raw):
+        return None
+    return ":".join(f"{b:02X}" for b in raw)
 
-async def _tcp_open(ip: str, port: int) -> bool:
+async def _tcp_probe(ip: str, port: int, timeout: float) -> bool:
     try:
-        coro = asyncio.open_connection(ip, port)
-        reader, writer = await asyncio.wait_for(coro, timeout=TCP_TIMEOUT)
+        fut = asyncio.open_connection(ip, port)
+        reader, writer = await asyncio.wait_for(fut, timeout=timeout)
         writer.close()
         try:
             await writer.wait_closed()
@@ -95,222 +110,279 @@ async def _tcp_open(ip: str, port: int) -> bool:
     except Exception:
         return False
 
+async def _host_looks_like_printer(ip: str) -> Tuple[bool, Optional[int]]:
+    # Return (is_candidate, web_port_if_any)
+    # Probe ports; any hit makes it a candidate.
+    for p in PRINTER_PORTS:
+        if await _tcp_probe(ip, p, CONNECT_TIMEOUT):
+            web_port = p if p in (80, 443) else None
+            return True, web_port
+    return False, None
 
-async def _probe_ip(ip: str, sem: asyncio.Semaphore) -> List[int]:
-    async with sem:
-        checks = await asyncio.gather(*[_tcp_open(ip, p) for p in PROBE_PORTS], return_exceptions=True)
-        open_ports: List[int] = []
-        for p, ok in zip(PROBE_PORTS, checks):
-            if ok is True:
-                open_ports.append(p)
-        return open_ports
+async def snmp_get(ip: str, oids: List[str]) -> Dict[str, str]:
+    """
+    SNMP GET multiple OIDs (v2c by default).
+    Returns dict oid->pretty string.
+    """
+    if not ENABLE_SNMP:
+        return {}
 
+    snmpEngine = SnmpEngine()
+    auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
+    target = await UdpTransportTarget.create(
+        (ip, SNMP_PORT),
+        timeout=SNMP_TIMEOUT,
+        retries=SNMP_RETRIES,
+    )
+    ctx = ContextData()
 
-def _reverse_name(ip: str) -> Optional[str]:
-    if not ENABLE_REVERSE_DNS:
-        return None
+    var_binds = [ObjectType(ObjectIdentity(oid)) for oid in oids]
+    iterator = get_cmd(snmpEngine, auth, target, ctx, *var_binds)
+
     try:
-        host, _, _ = socket.gethostbyaddr(ip)
-        return host
-    except Exception:
-        return None
-
-
-def _best_url(ip: str, open_ports: List[int], mdns_port: Optional[int] = None) -> str:
-    if 443 in open_ports:
-        return f"https://{ip}"
-    if 80 in open_ports:
-        return f"http://{ip}"
-    if mdns_port:
-        return f"http://{ip}:{mdns_port}"
-    if 631 in open_ports:
-        return f"http://{ip}:631"
-    return f"http://{ip}"
-
-
-def _is_printer_candidate(open_ports: List[int], mdns_seen: bool) -> bool:
-    if mdns_seen:
-        return True
-    if REQUIRE_PRINT_PORT:
-        return (9100 in open_ports) or (631 in open_ports)
-    return bool(set(open_ports) & {9100, 631, 80, 443})
-
-
-def _fmt_mac(val) -> str:
-    try:
-        b = bytes(val)
-        if not b or all(x == 0 for x in b):
-            return ""
-        if len(b) >= 6:
-            b = b[-6:]
-        return ":".join(f"{x:02x}" for x in b)
-    except Exception:
-        return ""
-
-
-async def snmp_get(ip: str, oid: str) -> str:
-    try:
-        engine = SnmpEngine()
-        target = UdpTransportTarget((ip, 161), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES)
-        community = CommunityData(SNMP_COMMUNITY, mpModel=1)  # SNMPv2c
-        errorIndication, errorStatus, errorIndex, varBinds = await getCmd(
-            engine, community, target, ContextData(),
-            ObjectType(ObjectIdentity(oid)),
-        )
+        errorIndication, errorStatus, errorIndex, outVarBinds = await iterator
         if errorIndication or errorStatus:
-            return ""
-        for _, val in varBinds:
-            return str(val).strip()
-        return ""
-    except Exception:
-        return ""
+            return {}
+        out: Dict[str, str] = {}
+        for vb in outVarBinds:
+            oid_str = vb[0].prettyPrint()
+            val_str = vb[1].prettyPrint()
+            out[oid_str] = val_str
+        return out
+    finally:
+        try:
+            snmpEngine.close_dispatcher()
+        except Exception:
+            pass
 
+async def snmp_walk_first_mac(ip: str) -> Optional[str]:
+    """
+    Walk IF-MIB ifPhysAddress and return the first non-empty MAC-like value.
+    """
+    if not ENABLE_SNMP:
+        return None
 
-async def snmp_first_mac(ip: str) -> str:
+    snmpEngine = SnmpEngine()
+    auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c (GETBULK supported)
+    target = await UdpTransportTarget.create(
+        (ip, SNMP_PORT),
+        timeout=SNMP_TIMEOUT,
+        retries=SNMP_RETRIES,
+    )
+    ctx = ContextData()
+
+    base = ObjectType(ObjectIdentity(OID_IF_PHYS_ADDR_BASE))
+
     try:
-        engine = SnmpEngine()
-        target = UdpTransportTarget((ip, 161), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES)
-        community = CommunityData(SNMP_COMMUNITY, mpModel=1)  # SNMPv2c
-
-        async for (errorIndication, errorStatus, errorIndex, varBinds) in nextCmd(
-            engine, community, target, ContextData(),
-            ObjectType(ObjectIdentity(OID_IFPHYS)),
+        # GETBULK-based walk is far faster than GETNEXT one-by-one
+        async for (errorIndication, errorStatus, errorIndex, varBinds) in bulk_walk_cmd(
+            snmpEngine,
+            auth,
+            target,
+            ctx,
+            0,      # nonRepeaters
+            25,     # maxRepetitions
+            base,
             lexicographicMode=False,
+            lookupMib=False,
         ):
             if errorIndication or errorStatus:
-                break
-            for _, val in varBinds:
-                mac = _fmt_mac(val)
+                return None
+
+            for vb in varBinds:
+                # vb[1] may be OctetString; try to treat as bytes
+                try:
+                    raw = bytes(vb[1])
+                except Exception:
+                    raw = b""
+                mac = _format_mac(raw)
                 if mac:
                     return mac
-        return ""
-    except Exception:
-        return ""
+        return None
+    finally:
+        try:
+            snmpEngine.close_dispatcher()
+        except Exception:
+            pass
 
+def _merge_printer(p: Printer) -> None:
+    existing = PRINTERS.get(p.ip)
+    if not existing:
+        PRINTERS[p.ip] = p
+        return
 
-def _build_details(ip: str, mac: str, serial: str) -> str:
-    parts = [f"IP: {ip}"]
-    if mac:
-        parts.append(f"MAC: {mac}")
-    if serial:
-        parts.append(f"SN: {serial}")
-    return " | ".join(parts)
+    # Merge “best known” fields
+    existing.last_seen = max(existing.last_seen, p.last_seen)
+    existing.source = "both" if existing.source != p.source else existing.source
+    existing.name = existing.name or p.name
+    existing.web = existing.web or p.web
+    existing.serial = existing.serial or p.serial
+    existing.mac = existing.mac or p.mac
+    existing.sys_descr = existing.sys_descr or p.sys_descr
 
-
-class _MDNSListener(ServiceListener):
-    def __init__(self):
-        self.found: Dict[str, Dict[str, object]] = {}
-
+# -------------------------
+# mDNS discovery (optional)
+# -------------------------
+class PrinterListener(ServiceListener):
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        info = zc.get_service_info(type_, name, timeout=1500)
-        if not info or not info.addresses:
-            return
-        ip = socket.inet_ntoa(info.addresses[0])
-        if ip in EXCLUDE_IPS:
-            return
-        port = info.port
-        display = name.split("._")[0]
-        self.found[ip] = {"name": display, "ip": ip, "mdns_port": port, "source": "mdns"}
+        asyncio.create_task(self._handle(zc, type_, name))
 
     def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        self.add_service(zc, type_, name)
+        asyncio.create_task(self._handle(zc, type_, name))
 
     def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         pass
 
+    async def _handle(self, zc: Zeroconf, type_: str, name: str) -> None:
+        info = zc.get_service_info(type_, name)
+        if not info or not info.addresses:
+            return
+        # Take first IPv4
+        ip = None
+        for addr in info.addresses:
+            if len(addr) == 4:
+                ip = socket.inet_ntoa(addr)
+                break
+        if not ip:
+            return
 
-async def discover_printers() -> List[Dict[str, object]]:
-    results: Dict[str, Dict[str, object]] = {}
+        display = name.split(".")[0] if name else ip
+        web = None
+        if info.port:
+            # Guess web URL if it looks like HTTP-ish; otherwise leave blank
+            if info.port in (80, 443):
+                scheme = "https" if info.port == 443 else "http"
+                web = f"{scheme}://{ip}:{info.port}/"
 
-    # 1) mDNS
-    listener = _MDNSListener()
+        p = Printer(
+            name=display,
+            ip=ip,
+            web=web,
+            source="mdns",
+            last_seen=_now(),
+        )
+        _merge_printer(p)
+
+async def mdns_task():
+    if not ENABLE_MDNS:
+        return
+    zc = Zeroconf(ip_version=IPVersion.V4Only)
+    listener = PrinterListener()
+
+    # Common printer-ish service types
+    types = [
+        "_printer._tcp.local.",
+        "_ipp._tcp.local.",
+        "_ipps._tcp.local.",
+    ]
+    browsers = [ServiceBrowser(zc, t, listener) for t in types]
     try:
-        zc = Zeroconf(ip_version=IPVersion.V4Only)
-        _ = [ServiceBrowser(zc, t, listener) for t in MDNS_TYPES]
-        await asyncio.sleep(2.5)
-        zc.close()
-    except Exception:
-        pass
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        try:
+            zc.close()
+        except Exception:
+            pass
 
-    for ip, item in listener.found.items():
-        results[ip] = item
+# -------------------------
+# Subnet scan + SNMP enrich
+# -------------------------
+async def scan_subnet_once():
+    global LAST_SCAN
 
-    # 2) TCP probe
-    ips = _expand_subnets()
+    net = ipaddress.ip_network(SUBNET, strict=False)
     sem = asyncio.Semaphore(CONCURRENCY)
-    probed = await asyncio.gather(*[_probe_ip(ip, sem) for ip in ips], return_exceptions=True)
 
-    for ip, open_ports in zip(ips, probed):
-        if not isinstance(open_ports, list):
-            continue
+    async def scan_ip(ip: str):
+        async with sem:
+            ok, web_port = await _host_looks_like_printer(ip)
+            if not ok:
+                return
 
-        mdns_seen = ip in results
-        if not _is_printer_candidate(open_ports, mdns_seen):
-            continue
+            web = None
+            if web_port:
+                scheme = "https" if web_port == 443 else "http"
+                web = f"{scheme}://{ip}:{web_port}/"
+            else:
+                # Many printers have HTTP on 80 even if we didn’t probe it first
+                web = f"http://{ip}/"
 
-        existing = results.get(ip, {})
-        mdns_port = existing.get("mdns_port") if isinstance(existing, dict) else None
+            p = Printer(
+                name=ip,  # will be replaced by sysName if available
+                ip=ip,
+                web=web,
+                source="scan",
+                last_seen=_now(),
+            )
 
-        if isinstance(existing, dict) and existing.get("name"):
-            name = str(existing["name"])
-        else:
-            name = _reverse_name(ip) or f"Printer {ip}"
+            # SNMP enrich
+            if ENABLE_SNMP:
+                got = await snmp_get(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
 
-        url = _best_url(ip, open_ports, mdns_port if isinstance(mdns_port, int) else None)
+                # Keys come back as pretty OIDs; map by suffix match
+                def pick_val(endswith: str) -> Optional[str]:
+                    for k, v in got.items():
+                        if k.endswith(endswith):
+                            return v
+                    return None
 
-        merged = {
-            "name": name,
-            "ip": ip,
-            "url": url,
-            "open_ports": open_ports,
-            "source": existing.get("source", "probe") if isinstance(existing, dict) else "probe",
-        }
-        if isinstance(mdns_port, int):
-            merged["mdns_port"] = mdns_port
+                sys_name = pick_val(OID_SYS_NAME)
+                sys_descr = pick_val(OID_SYS_DESCR)
+                serial = pick_val(OID_PRT_SERIAL) or pick_val(OID_ENT_SERIAL_1)
 
-        results[ip] = merged
+                if sys_name:
+                    p.name = sys_name
+                if sys_descr:
+                    p.sys_descr = sys_descr
+                if serial and serial.strip():
+                    p.serial = serial.strip()
 
-    # 3) SNMP enrich
-    if ENABLE_SNMP and results:
-        snmp_sem = asyncio.Semaphore(SNMP_CONCURRENCY)
+                # MAC via IF-MIB walk
+                mac = await snmp_walk_first_mac(ip)
+                if mac:
+                    p.mac = mac
 
-        async def enrich_one(ip: str):
-            async with snmp_sem:
-                serial = await snmp_get(ip, OID_SERIAL)
-                mac = await snmp_first_mac(ip)
-                results[ip]["serial"] = serial or ""
-                results[ip]["mac"] = mac or ""
-                results[ip]["details"] = _build_details(ip, mac, serial)
+            _merge_printer(p)
 
-        await asyncio.gather(*[enrich_one(ip) for ip in list(results.keys())], return_exceptions=True)
-    else:
-        for ip in results.keys():
-            results[ip]["serial"] = ""
-            results[ip]["mac"] = ""
-            results[ip]["details"] = _build_details(ip, "", "")
+    tasks = [asyncio.create_task(scan_ip(str(h))) for h in net.hosts()]
+    await asyncio.gather(*tasks)
+    LAST_SCAN = _now()
 
-    def ip_key(x: str) -> Tuple[int, int, int, int]:
-        return tuple(int(p) for p in x.split("."))  # type: ignore
-
-    return [results[k] for k in sorted(results.keys(), key=ip_key)]
-
-
-async def _refresh_loop():
+async def scan_loop():
     while True:
         try:
-            data = await discover_printers()
-            _cache["data"] = data
-            _cache["ts"] = time.time()
+            await scan_subnet_once()
         except Exception:
+            # Don’t crash the container if something weird happens mid-scan
             pass
         await asyncio.sleep(SCAN_INTERVAL)
 
+# -------------------------
+# API
+# -------------------------
+@APP.get("/health")
+def health():
+    return {"ok": True, "subnet": SUBNET, "last_scan": LAST_SCAN}
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(_refresh_loop())
-
-
-@app.get("/api/printers")
+@APP.get("/api/printers")
 def api_printers():
-    return {"data": _cache["data"], "lastUpdated": _cache["ts"]}
+    # sort by name then ip
+    items = sorted(PRINTERS.values(), key=lambda p: (p.name.lower(), p.ip))
+    return {
+        "subnet": SUBNET,
+        "last_scan": LAST_SCAN,
+        "count": len(items),
+        "printers": [
+            {
+                **asdict(p),
+                "details": p.details,
+            }
+            for p in items
+        ],
+    }
+
+@APP.on_event("startup")
+async def startup():
+    asyncio.create_task(scan_loop())
+    asyncio.create_task(mdns_task())
