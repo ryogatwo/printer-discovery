@@ -1,15 +1,16 @@
 import asyncio
 import ipaddress
+import logging
 import os
+import re
 import socket
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
 from zeroconf import IPVersion, ServiceBrowser, ServiceListener, Zeroconf
 
-# PySNMP v7+ (asyncio, v3arch)
 from pysnmp.hlapi.v3arch.asyncio import (
     SnmpEngine,
     CommunityData,
@@ -21,7 +22,13 @@ from pysnmp.hlapi.v3arch.asyncio import (
     bulk_walk_cmd,
 )
 
-app = FastAPI(title="Printer Discovery", version="1.2.1")
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+log = logging.getLogger("printer-discovery")
+
+app = FastAPI(title="Printer Discovery", version="1.2.2")
 
 # -------------------------
 # Config (env)
@@ -57,6 +64,9 @@ OID_ENT_SERIAL_1 = "1.3.6.1.2.1.47.1.1.1.1.11.1"
 # IF-MIB ifPhysAddress.<ifIndex>
 OID_IF_PHYS_ADDR_BASE = "1.3.6.1.2.1.2.2.1.6"
 
+# Main Uvicorn loop (set at startup)
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
 # -------------------------
 # Data model
 # -------------------------
@@ -86,13 +96,7 @@ class Printer:
 PRINTERS: Dict[str, Printer] = {}
 LAST_SCAN: float = 0.0
 
-# Main Uvicorn loop (set at startup)
-MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-
-# -------------------------
-# Helpers
-# -------------------------
 def _now() -> float:
     return time.time()
 
@@ -102,7 +106,30 @@ def _format_mac(raw: bytes) -> Optional[str]:
         return None
     if all(b == 0x00 for b in raw):
         return None
+    # ignore multicast MACs (least significant bit of first octet set)
+    if raw[0] & 0x01:
+        return None
     return ":".join(f"{b:02X}" for b in raw)
+
+
+def _mac_to_compact(mac: str) -> str:
+    return re.sub(r"[^0-9a-fA-F]", "", mac).lower()
+
+
+def _extract_mdns_mac_hint(name: str) -> Optional[str]:
+    # Examples: "Brother HL-L2460DW [94ddf86a9634]" -> "94ddf86a9634"
+    m = re.search(r"\[([0-9a-fA-F]{8,16})\]", name or "")
+    return m.group(1).lower() if m else None
+
+
+def _choose_best_mac(candidates: List[str], hint: Optional[str]) -> Optional[str]:
+    if not candidates:
+        return None
+    if hint:
+        for mac in candidates:
+            if _mac_to_compact(mac).endswith(hint) or hint in _mac_to_compact(mac):
+                return mac
+    return candidates[0]
 
 
 async def _tcp_probe(ip: str, port: int, timeout: float) -> bool:
@@ -138,7 +165,30 @@ async def _pick_web_url(ip: str) -> str:
     return f"http://{ip}/"
 
 
-async def snmp_get(ip: str, oids: List[str]) -> Dict[str, str]:
+def _merge_printer(p: Printer) -> None:
+    existing = PRINTERS.get(p.ip)
+    if not existing:
+        PRINTERS[p.ip] = p
+        return
+
+    existing.last_seen = max(existing.last_seen, p.last_seen)
+    existing.source = "both" if existing.source != p.source else existing.source
+    existing.name = existing.name or p.name
+    existing.web = existing.web or p.web
+    existing.serial = existing.serial or p.serial
+    existing.mac = existing.mac or p.mac
+    existing.sys_descr = existing.sys_descr or p.sys_descr
+    if not existing.print_ports and p.print_ports:
+        existing.print_ports = p.print_ports
+
+
+# -------------------------
+# SNMP helpers
+# -------------------------
+async def snmp_get_map(ip: str, oids: List[str]) -> Dict[str, str]:
+    """
+    SNMP GET multiple OIDs (v2c). Returns dict mapping *requested oid* -> value.
+    """
     if not ENABLE_SNMP:
         return {}
 
@@ -158,9 +208,11 @@ async def snmp_get(ip: str, oids: List[str]) -> Dict[str, str]:
         errorIndication, errorStatus, errorIndex, outVarBinds = await iterator
         if errorIndication or errorStatus:
             return {}
+
         out: Dict[str, str] = {}
-        for vb in outVarBinds:
-            out[vb[0].prettyPrint()] = vb[1].prettyPrint()
+        # Map values back to the requested OIDs in order
+        for req_oid, vb in zip(oids, outVarBinds):
+            out[req_oid] = vb[1].prettyPrint()
         return out
     finally:
         try:
@@ -169,9 +221,12 @@ async def snmp_get(ip: str, oids: List[str]) -> Dict[str, str]:
             pass
 
 
-async def snmp_walk_first_mac(ip: str) -> Optional[str]:
+async def snmp_walk_macs(ip: str) -> List[str]:
+    """
+    Walk IF-MIB ifPhysAddress and return list of non-empty MACs.
+    """
     if not ENABLE_SNMP:
-        return None
+        return []
 
     snmpEngine = SnmpEngine()
     auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
@@ -181,9 +236,9 @@ async def snmp_walk_first_mac(ip: str) -> Optional[str]:
         retries=SNMP_RETRIES,
     )
     ctx = ContextData()
-
     base = ObjectType(ObjectIdentity(OID_IF_PHYS_ADDR_BASE))
 
+    macs: List[str] = []
     try:
         async for (errorIndication, errorStatus, errorIndex, varBinds) in bulk_walk_cmd(
             snmpEngine,
@@ -197,17 +252,18 @@ async def snmp_walk_first_mac(ip: str) -> Optional[str]:
             lookupMib=False,
         ):
             if errorIndication or errorStatus:
-                return None
+                return []
 
             for vb in varBinds:
+                val = vb[1]
                 try:
-                    raw = bytes(vb[1])
+                    raw = val.asOctets() if hasattr(val, "asOctets") else bytes(val)
                 except Exception:
                     raw = b""
                 mac = _format_mac(raw)
-                if mac:
-                    return mac
-        return None
+                if mac and mac not in macs:
+                    macs.append(mac)
+        return macs
     finally:
         try:
             snmpEngine.close_dispatcher()
@@ -215,21 +271,28 @@ async def snmp_walk_first_mac(ip: str) -> Optional[str]:
             pass
 
 
-def _merge_printer(p: Printer) -> None:
-    existing = PRINTERS.get(p.ip)
-    if not existing:
-        PRINTERS[p.ip] = p
-        return
+async def snmp_enrich(ip: str, name_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns (sys_name, sys_descr, serial, mac)
+    """
+    if not ENABLE_SNMP:
+        return None, None, None, None
 
-    existing.last_seen = max(existing.last_seen, p.last_seen)
-    existing.source = "both" if existing.source != p.source else existing.source
-    existing.name = existing.name or p.name
-    existing.web = existing.web or p.web
-    existing.serial = existing.serial or p.serial
-    existing.mac = existing.mac or p.mac
-    existing.sys_descr = existing.sys_descr or p.sys_descr
-    if not existing.print_ports and p.print_ports:
-        existing.print_ports = p.print_ports
+    try:
+        got = await snmp_get_map(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
+
+        sys_name = got.get(OID_SYS_NAME)
+        sys_descr = got.get(OID_SYS_DESCR)
+
+        serial = (got.get(OID_PRT_SERIAL) or got.get(OID_ENT_SERIAL_1) or "").strip() or None
+
+        mac_candidates = await snmp_walk_macs(ip)
+        mac = _choose_best_mac(mac_candidates, name_hint)
+
+        return sys_name, sys_descr, serial, mac
+    except Exception as e:
+        log.warning("SNMP enrich failed for %s: %s", ip, e)
+        return None, None, None, None
 
 
 # -------------------------
@@ -251,11 +314,9 @@ class MdnsListener(ServiceListener):
     def _schedule(self, zc: Zeroconf, type_: str, name: str) -> None:
         # Called from zeroconf worker thread -> schedule onto main asyncio loop
         fut = asyncio.run_coroutine_threadsafe(self._handle(zc, type_, name), self.loop)
-        # Silence “unretrieved exception” warnings
-        fut.add_done_callback(lambda f: f.exception() if f.cancelled() is False else None)
+        fut.add_done_callback(lambda f: f.exception() if (not f.cancelled()) else None)
 
     async def _handle(self, zc: Zeroconf, type_: str, name: str) -> None:
-        # zc.get_service_info can block; run in a thread to avoid blocking uvicorn loop
         def _get():
             return zc.get_service_info(type_, name, timeout=1500)
 
@@ -272,19 +333,22 @@ class MdnsListener(ServiceListener):
             return
 
         display = name.split(".")[0] if name else ip
-
         mdns_port = int(info.port) if info.port else None
-        # Only keep mdns entries that are actually printer-ish services
-        # (_ipp/_ipps are printers; _printer usually is too)
-        # print_ports here is informational only.
-        print_ports = [mdns_port] if (mdns_port in QUALIFY_PORTS) else None
 
+        # For display only; qualification is handled by subnet scan
+        print_ports = [mdns_port] if (mdns_port in QUALIFY_PORTS) else None
         web = await _pick_web_url(ip)
 
+        hint = _extract_mdns_mac_hint(display)
+        sys_name, sys_descr, serial, mac = await snmp_enrich(ip, hint)
+
         p = Printer(
-            name=display,
+            name=(sys_name or display),
             ip=ip,
             web=web,
+            serial=serial,
+            mac=mac,
+            sys_descr=sys_descr,
             source="mdns",
             last_seen=_now(),
             print_ports=print_ports,
@@ -302,7 +366,7 @@ async def mdns_task():
     listener = MdnsListener(MAIN_LOOP)
 
     types = ["_printer._tcp.local.", "_ipp._tcp.local.", "_ipps._tcp.local."]
-    browsers = [ServiceBrowser(zc, t, listener) for t in types]
+    _browsers = [ServiceBrowser(zc, t, listener) for t in types]
 
     try:
         while True:
@@ -330,40 +394,19 @@ async def scan_subnet_once():
                 return
 
             web = await _pick_web_url(ip)
+            sys_name, sys_descr, serial, mac = await snmp_enrich(ip, None)
 
             p = Printer(
-                name=ip,
+                name=(sys_name or ip),
                 ip=ip,
                 web=web,
+                serial=serial,
+                mac=mac,
+                sys_descr=sys_descr,
                 source="scan",
                 last_seen=_now(),
                 print_ports=print_ports,
             )
-
-            if ENABLE_SNMP:
-                got = await snmp_get(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
-
-                def pick_val(endswith: str) -> Optional[str]:
-                    for k, v in got.items():
-                        if k.endswith(endswith):
-                            return v
-                    return None
-
-                sys_name = pick_val(OID_SYS_NAME)
-                sys_descr = pick_val(OID_SYS_DESCR)
-                serial = pick_val(OID_PRT_SERIAL) or pick_val(OID_ENT_SERIAL_1)
-
-                if sys_name:
-                    p.name = sys_name
-                if sys_descr:
-                    p.sys_descr = sys_descr
-                if serial and serial.strip():
-                    p.serial = serial.strip()
-
-                mac = await snmp_walk_first_mac(ip)
-                if mac:
-                    p.mac = mac
-
             _merge_printer(p)
 
     tasks = [asyncio.create_task(scan_ip(str(h))) for h in net.hosts()]
@@ -375,8 +418,8 @@ async def scan_loop():
     while True:
         try:
             await scan_subnet_once()
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("scan loop error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 
@@ -403,13 +446,7 @@ def api_printers():
         "subnet": SUBNET,
         "last_scan": LAST_SCAN,
         "count": len(items),
-        "printers": [
-            {
-                **asdict(p),
-                "details": p.details,
-            }
-            for p in items
-        ],
+        "printers": [{**asdict(p), "details": p.details} for p in items],
     }
 
 
