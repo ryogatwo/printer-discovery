@@ -21,7 +21,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     bulk_walk_cmd,
 )
 
-APP = FastAPI(title="Printer Discovery", version="1.0.0")
+app = FastAPI(title="Printer Discovery", version="1.0.0")
 
 # -------------------------
 # Config (env)
@@ -361,11 +361,11 @@ async def scan_loop():
 # -------------------------
 # API
 # -------------------------
-@APP.get("/health")
+@app.get("/health")
 def health():
     return {"ok": True, "subnet": SUBNET, "last_scan": LAST_SCAN}
 
-@APP.get("/api/printers")
+@app.get("/api/printers")
 def api_printers():
     # sort by name then ip
     items = sorted(PRINTERS.values(), key=lambda p: (p.name.lower(), p.ip))
@@ -382,7 +382,7 @@ def api_printers():
         ],
     }
 
-@APP.on_event("startup")
+@app.on_event("startup")
 async def startup():
     asyncio.create_task(scan_loop())
     asyncio.create_task(mdns_task())
