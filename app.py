@@ -6,7 +6,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI
 from zeroconf import IPVersion, ServiceBrowser, ServiceListener, Zeroconf
@@ -19,8 +19,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     ObjectType,
     ObjectIdentity,
     get_cmd,
-    bulk_walk_cmd,
-    walk_cmd,  # <-- NEW: GETNEXT-style walk fallback
+    walk_cmd,  # GETNEXT-style walk (like snmpwalk)
 )
 
 # -------------------------
@@ -29,14 +28,14 @@ from pysnmp.hlapi.v3arch.asyncio import (
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger("printer-discovery")
 
-app = FastAPI(title="Printer Discovery", version="1.2.3")
+app = FastAPI(title="Printer Discovery", version="1.2.4")
 
 # -------------------------
 # Config (env)
 # -------------------------
 SUBNET = os.getenv("SUBNET", "10.1.10.0/24")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # seconds
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "0.25"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "200"))
 
@@ -48,24 +47,22 @@ SNMP_PORT = int(os.getenv("SNMP_PORT", "161"))
 SNMP_TIMEOUT = float(os.getenv("SNMP_TIMEOUT", "1.0"))
 SNMP_RETRIES = int(os.getenv("SNMP_RETRIES", "0"))
 
-# Only these ports qualify a device as a printer
+# Limits to prevent SNMP work from "stalling" discovery
+SNMP_CONCURRENCY = int(os.getenv("SNMP_CONCURRENCY", "20"))
+SNMP_ENRICH_TIMEOUT = float(os.getenv("SNMP_ENRICH_TIMEOUT", "3.0"))  # seconds
+SNMP_ENRICH_COOLDOWN = int(os.getenv("SNMP_ENRICH_COOLDOWN", "300"))  # seconds
+SNMP_MAX_IFPHYS_ROWS = int(os.getenv("SNMP_MAX_IFPHYS_ROWS", "25"))   # max rows to inspect
+
 QUALIFY_PORTS = [int(p) for p in os.getenv("QUALIFY_PORTS", "9100,631,515").split(",") if p.strip()]
-# Only used to build a clickable link (do NOT qualify)
 WEB_PORTS = [int(p) for p in os.getenv("WEB_PORTS", "443,80").split(",") if p.strip()]
 
-# OIDs (best-effort)
+# OIDs
 OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0"
 OID_SYS_NAME = "1.3.6.1.2.1.1.5.0"
+OID_PRT_SERIAL = "1.3.6.1.2.1.43.5.1.1.17.1"          # Printer-MIB serial
+OID_ENT_SERIAL_1 = "1.3.6.1.2.1.47.1.1.1.1.11.1"      # ENTITY-MIB serial (some devices)
+OID_IF_PHYS_ADDR_BASE = "1.3.6.1.2.1.2.2.1.6"         # IF-MIB MAC table
 
-# Printer-MIB prtGeneralSerialNumber.1
-OID_PRT_SERIAL = "1.3.6.1.2.1.43.5.1.1.17.1"
-# ENTITY-MIB entPhysicalSerialNum.1 (some vendors)
-OID_ENT_SERIAL_1 = "1.3.6.1.2.1.47.1.1.1.1.11.1"
-
-# IF-MIB ifPhysAddress.<ifIndex>
-OID_IF_PHYS_ADDR_BASE = "1.3.6.1.2.1.2.2.1.6"
-
-# Main Uvicorn loop (set at startup)
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # -------------------------
@@ -97,6 +94,11 @@ class Printer:
 PRINTERS: Dict[str, Printer] = {}
 LAST_SCAN: float = 0.0
 
+# SNMP enrichment control
+_snmp_sem = asyncio.Semaphore(SNMP_CONCURRENCY)
+_enrich_in_flight: Set[str] = set()
+_enrich_next_allowed: Dict[str, float] = {}
+
 
 def _now() -> float:
     return time.time()
@@ -105,59 +107,29 @@ def _now() -> float:
 def _format_mac(raw: bytes) -> Optional[str]:
     if not raw:
         return None
-    # Some agents return variable-length addresses; prefer last 6 bytes if longer.
     if len(raw) > 6:
         raw = raw[-6:]
     if len(raw) != 6:
         return None
     if all(b == 0x00 for b in raw):
         return None
-    # ignore multicast MACs (LSB of first octet set)
+    # ignore multicast MACs
     if raw[0] & 0x01:
         return None
     return ":".join(f"{b:02X}" for b in raw)
 
 
-def _mac_to_compact(mac: str) -> str:
-    return re.sub(r"[^0-9a-fA-F]", "", mac).lower()
+def _compact_hex(s: str) -> str:
+    return re.sub(r"[^0-9a-fA-F]", "", s or "").lower()
 
 
-def _extract_mac_hint(text: str) -> Optional[str]:
-    """
-    Tries to pull a MAC-ish hint from common printer naming patterns:
-      - "... [94ddf86a9634]"
-      - "BRWD8B32F1E6A9C"  (Brother-style)
-      - any 12-hex run
-    Returns 12 hex lowercase if found.
-    """
-    s = (text or "").strip()
-
-    # bracket form: [94ddf86a9634]
-    m = re.search(r"\[([0-9a-fA-F]{12})\]", s)
-    if m:
-        return m.group(1).lower()
-
-    # Brother-ish: BRW + 12 hex
-    m = re.search(r"\bBRW([0-9a-fA-F]{12})\b", s)
-    if m:
-        return m.group(1).lower()
-
-    # any 12-hex chunk (last resort)
-    m = re.search(r"([0-9a-fA-F]{12})", s)
-    if m:
-        return m.group(1).lower()
-
-    return None
-
-
-def _choose_best_mac(candidates: List[str], hint12: Optional[str]) -> Optional[str]:
-    if not candidates:
+def _brother_mac_from_sysname(sys_name: str) -> Optional[str]:
+    # Brother sysName often looks like: BRWD8B32F1E6A9C
+    m = re.search(r"\bBRW([0-9A-Fa-f]{12})\b", sys_name or "")
+    if not m:
         return None
-    if hint12:
-        for mac in candidates:
-            if _mac_to_compact(mac).endswith(hint12):
-                return mac
-    return candidates[0]
+    h = m.group(1).lower()
+    return ":".join(h[i:i+2].upper() for i in range(0, 12, 2))
 
 
 async def _tcp_probe(ip: str, port: int, timeout: float) -> bool:
@@ -214,19 +186,12 @@ def _merge_printer(p: Printer) -> None:
 # SNMP helpers
 # -------------------------
 async def snmp_get_map(ip: str, oids: List[str]) -> Dict[str, str]:
-    """
-    SNMP GET multiple OIDs (v2c). Returns dict mapping *requested oid* -> value.
-    """
     if not ENABLE_SNMP:
         return {}
 
     snmpEngine = SnmpEngine()
     auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
-    target = await UdpTransportTarget.create(
-        (ip, SNMP_PORT),
-        timeout=SNMP_TIMEOUT,
-        retries=SNMP_RETRIES,
-    )
+    target = await UdpTransportTarget.create((ip, SNMP_PORT), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES)
     ctx = ContextData()
 
     var_binds = [ObjectType(ObjectIdentity(oid)) for oid in oids]
@@ -236,7 +201,6 @@ async def snmp_get_map(ip: str, oids: List[str]) -> Dict[str, str]:
         errorIndication, errorStatus, errorIndex, outVarBinds = await iterator
         if errorIndication or errorStatus:
             return {}
-
         out: Dict[str, str] = {}
         for req_oid, vb in zip(oids, outVarBinds):
             out[req_oid] = vb[1].prettyPrint()
@@ -248,69 +212,21 @@ async def snmp_get_map(ip: str, oids: List[str]) -> Dict[str, str]:
             pass
 
 
-async def _snmp_walk_ifphysaddress_getbulk(ip: str) -> List[str]:
+async def snmp_get_first_mac(ip: str) -> Optional[str]:
     """
-    Fast path: GETBULK walk ifPhysAddress.
-    Some printers don't behave well here; caller will fallback to GETNEXT walk.
+    Walk IF-MIB ifPhysAddress using GETNEXT-style walk_cmd and return the first valid MAC.
+    This mirrors the behavior of snmpwalk closely. walk_cmd stops when it leaves subtree. :contentReference[oaicite:1]{index=1}
     """
+    if not ENABLE_SNMP:
+        return None
+
     snmpEngine = SnmpEngine()
-    auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
-    target = await UdpTransportTarget.create(
-        (ip, SNMP_PORT),
-        timeout=SNMP_TIMEOUT,
-        retries=SNMP_RETRIES,
-    )
+    auth = CommunityData(SNMP_COMMUNITY, mpModel=1)
+    target = await UdpTransportTarget.create((ip, SNMP_PORT), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES)
     ctx = ContextData()
     base = ObjectType(ObjectIdentity(OID_IF_PHYS_ADDR_BASE))
 
-    macs: List[str] = []
-    try:
-        async for (errorIndication, errorStatus, errorIndex, varBinds) in bulk_walk_cmd(
-            snmpEngine,
-            auth,
-            target,
-            ctx,
-            0,
-            25,
-            base,
-            lexicographicMode=False,
-            lookupMib=False,
-        ):
-            if errorIndication or errorStatus:
-                return []
-
-            for vb in varBinds:
-                val = vb[1]
-                try:
-                    raw = val.asOctets() if hasattr(val, "asOctets") else bytes(val)
-                except Exception:
-                    raw = b""
-                mac = _format_mac(raw)
-                if mac and mac not in macs:
-                    macs.append(mac)
-        return macs
-    finally:
-        try:
-            snmpEngine.close_dispatcher()
-        except Exception:
-            pass
-
-
-async def _snmp_walk_ifphysaddress_getnext(ip: str) -> List[str]:
-    """
-    Reliable path: GETNEXT-style walk (like snmpwalk).
-    """
-    snmpEngine = SnmpEngine()
-    auth = CommunityData(SNMP_COMMUNITY, mpModel=1)  # v2c
-    target = await UdpTransportTarget.create(
-        (ip, SNMP_PORT),
-        timeout=SNMP_TIMEOUT,
-        retries=SNMP_RETRIES,
-    )
-    ctx = ContextData()
-    base = ObjectType(ObjectIdentity(OID_IF_PHYS_ADDR_BASE))
-
-    macs: List[str] = []
+    rows = 0
     try:
         async for (errorIndication, errorStatus, errorIndex, varBinds) in walk_cmd(
             snmpEngine,
@@ -322,7 +238,7 @@ async def _snmp_walk_ifphysaddress_getnext(ip: str) -> List[str]:
             lookupMib=False,
         ):
             if errorIndication or errorStatus:
-                return []
+                return None
 
             for vb in varBinds:
                 val = vb[1]
@@ -331,9 +247,13 @@ async def _snmp_walk_ifphysaddress_getnext(ip: str) -> List[str]:
                 except Exception:
                     raw = b""
                 mac = _format_mac(raw)
-                if mac and mac not in macs:
-                    macs.append(mac)
-        return macs
+                if mac:
+                    return mac
+
+            rows += 1
+            if rows >= SNMP_MAX_IFPHYS_ROWS:
+                return None
+        return None
     finally:
         try:
             snmpEngine.close_dispatcher()
@@ -341,51 +261,70 @@ async def _snmp_walk_ifphysaddress_getnext(ip: str) -> List[str]:
             pass
 
 
-async def snmp_walk_macs(ip: str) -> List[str]:
+async def snmp_enrich_ip(ip: str) -> None:
     """
-    Returns list of MACs from IF-MIB ifPhysAddress, best-effort.
-    Tries GETBULK first, then GETNEXT walk fallback.
-    """
-    if not ENABLE_SNMP:
-        return []
-
-    macs = await _snmp_walk_ifphysaddress_getbulk(ip)
-    if macs:
-        return macs
-
-    # Fallback for printers that don't like GETBULK
-    return await _snmp_walk_ifphysaddress_getnext(ip)
-
-
-async def snmp_enrich(ip: str, name_for_hint: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """
-    Returns (sys_name, sys_descr, serial, mac)
+    Enrich an existing PRINTERS[ip] entry with SNMP sysName/sysDescr/serial/MAC.
+    Runs with concurrency limits + cooldown so discovery doesn't stall.
     """
     if not ENABLE_SNMP:
-        return None, None, None, None
+        return
+
+    now = _now()
+    if now < _enrich_next_allowed.get(ip, 0):
+        return
+    if ip in _enrich_in_flight:
+        return
+
+    _enrich_in_flight.add(ip)
+    _enrich_next_allowed[ip] = now + SNMP_ENRICH_COOLDOWN
 
     try:
-        got = await snmp_get_map(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
+        async with _snmp_sem:
+            try:
+                await asyncio.wait_for(_snmp_enrich_core(ip), timeout=SNMP_ENRICH_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.debug("SNMP enrich timeout for %s", ip)
+    finally:
+        _enrich_in_flight.discard(ip)
 
-        sys_name = (got.get(OID_SYS_NAME) or "").strip() or None
-        sys_descr = (got.get(OID_SYS_DESCR) or "").strip() or None
-        serial = (got.get(OID_PRT_SERIAL) or got.get(OID_ENT_SERIAL_1) or "").strip() or None
 
-        mac_candidates = await snmp_walk_macs(ip)
+async def _snmp_enrich_core(ip: str) -> None:
+    got = await snmp_get_map(ip, [OID_SYS_NAME, OID_SYS_DESCR, OID_PRT_SERIAL, OID_ENT_SERIAL_1])
 
-        hint12 = None
-        # Prefer sys_name if present; else use mDNS display name
-        if sys_name:
-            hint12 = _extract_mac_hint(sys_name)
-        if not hint12 and name_for_hint:
-            hint12 = _extract_mac_hint(name_for_hint)
+    sys_name = (got.get(OID_SYS_NAME) or "").strip() or None
+    sys_descr = (got.get(OID_SYS_DESCR) or "").strip() or None
+    serial = (got.get(OID_PRT_SERIAL) or got.get(OID_ENT_SERIAL_1) or "").strip() or None
 
-        mac = _choose_best_mac(mac_candidates, hint12)
+    mac = None
 
-        return sys_name, sys_descr, serial, mac
-    except Exception as e:
-        log.warning("SNMP enrich failed for %s: %s", ip, e)
-        return None, None, None, None
+    # Fast path: Brother sysName encodes the MAC
+    if sys_name:
+        mac = _brother_mac_from_sysname(sys_name)
+
+    # Generic path: IF-MIB table (first valid MAC)
+    if not mac:
+        mac = await snmp_get_first_mac(ip)
+
+    p = PRINTERS.get(ip)
+    if not p:
+        return
+
+    # Update-in-place (keep existing fields if already populated)
+    if sys_name and not p.name:
+        p.name = sys_name
+    elif sys_name:
+        # Prefer SNMP sysName as authoritative name if current is just IP
+        if p.name == ip:
+            p.name = sys_name
+
+    if sys_descr and not p.sys_descr:
+        p.sys_descr = sys_descr
+
+    if serial and not p.serial:
+        p.serial = serial
+
+    if mac and not p.mac:
+        p.mac = mac
 
 
 # -------------------------
@@ -405,7 +344,7 @@ class MdnsListener(ServiceListener):
         pass
 
     def _schedule(self, zc: Zeroconf, type_: str, name: str) -> None:
-        # zeroconf runs callbacks in its own thread; schedule on main asyncio loop
+        # Zeroconf ServiceBrowser callbacks run in its dedicated thread; schedule on main loop
         fut = asyncio.run_coroutine_threadsafe(self._handle(zc, type_, name), self.loop)
         fut.add_done_callback(lambda f: f.exception() if (not f.cancelled()) else None)
 
@@ -427,37 +366,34 @@ class MdnsListener(ServiceListener):
 
         display = name.split(".")[0] if name else ip
         mdns_port = int(info.port) if info.port else None
-
         print_ports = [mdns_port] if (mdns_port in QUALIFY_PORTS) else None
+
         web = await _pick_web_url(ip)
 
-        sys_name, sys_descr, serial, mac = await snmp_enrich(ip, display)
-
+        # MERGE FIRST (so it shows up immediately)
         p = Printer(
-            name=(sys_name or display),
+            name=display,
             ip=ip,
             web=web,
-            serial=serial,
-            mac=mac,
-            sys_descr=sys_descr,
             source="mdns",
             last_seen=_now(),
             print_ports=print_ports,
         )
         _merge_printer(p)
 
+        # ENRICH IN BACKGROUND
+        asyncio.create_task(snmp_enrich_ip(ip))
+
 
 async def mdns_task():
-    if not ENABLE_MDNS:
-        return
-    if MAIN_LOOP is None:
+    if not ENABLE_MDNS or MAIN_LOOP is None:
         return
 
     zc = Zeroconf(ip_version=IPVersion.V4Only)
     listener = MdnsListener(MAIN_LOOP)
 
     types = ["_printer._tcp.local.", "_ipp._tcp.local.", "_ipps._tcp.local."]
-    _browsers = [ServiceBrowser(zc, t, listener) for t in types]
+    browsers = [ServiceBrowser(zc, t, listener) for t in types]
 
     try:
         while True:
@@ -470,7 +406,7 @@ async def mdns_task():
 
 
 # -------------------------
-# Subnet scan + SNMP enrich
+# Subnet scan (qualify) + background SNMP enrich
 # -------------------------
 async def scan_subnet_once():
     global LAST_SCAN
@@ -485,20 +421,20 @@ async def scan_subnet_once():
                 return
 
             web = await _pick_web_url(ip)
-            sys_name, sys_descr, serial, mac = await snmp_enrich(ip, None)
 
+            # MERGE FIRST
             p = Printer(
-                name=(sys_name or ip),
+                name=ip,
                 ip=ip,
                 web=web,
-                serial=serial,
-                mac=mac,
-                sys_descr=sys_descr,
                 source="scan",
                 last_seen=_now(),
                 print_ports=print_ports,
             )
             _merge_printer(p)
+
+            # ENRICH IN BACKGROUND
+            asyncio.create_task(snmp_enrich_ip(ip))
 
     tasks = [asyncio.create_task(scan_ip(str(h))) for h in net.hosts()]
     await asyncio.gather(*tasks)
@@ -527,6 +463,9 @@ def health():
         "web_ports": WEB_PORTS,
         "enable_mdns": ENABLE_MDNS,
         "enable_snmp": ENABLE_SNMP,
+        "snmp_concurrency": SNMP_CONCURRENCY,
+        "snmp_enrich_timeout": SNMP_ENRICH_TIMEOUT,
+        "snmp_enrich_cooldown": SNMP_ENRICH_COOLDOWN,
     }
 
 
